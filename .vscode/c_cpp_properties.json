@@ -1,0 +1,22 @@
+{
+  "configurations": [
+    {
+      "name": "ESP32-C6-IDF",
+      "compilerPath": "${env:HOME}/.espressif/tools/riscv32-esp-elf/esp-15.2.0_20251204/riscv32-esp-elf/bin/riscv32-esp-elf-gcc",
+      "compileCommands": "/home/shamil/Projects/esp32/C6_SuperMini/build/compile_commands.json",
+      "cStandard": "c11",
+      "cppStandard": "c++17",
+      "configurationProvider": "espressif.esp-idf-extension",
+      "browse": {
+        "path": [
+          "${workspaceFolder}",
+          "${workspaceFolder}/main",
+          "${workspaceFolder}/build/config",
+          "${env:HOME}/.esp/esp-idf/components"
+        ],
+        "limitSymbolsToIncludedHeaders": true
+      }
+    }
+  ],
+  "version": 4
+}

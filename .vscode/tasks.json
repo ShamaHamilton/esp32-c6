@@ -1,0 +1,57 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "IDF: Build",
+      "type": "shell",
+      "command": "bash",
+      "args": ["-c", "source ~/.esp/esp-idf/export.sh && idf.py build"],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    },
+    {
+      "label": "IDF: Flash",
+      "type": "shell",
+      "command": "bash",
+      "args": ["-c", "source ~/.esp/esp-idf/export.sh && idf.py -p /dev/ttyACM0 flash"],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      }
+    },
+    {
+      "label": "IDF: Monitor",
+      "type": "shell",
+      "command": "bash",
+      "args": ["-c", "source ~/.esp/esp-idf/export.sh && idf.py -p /dev/ttyACM0 monitor"],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      }
+    },
+    {
+      "label": "IDF: Menuconfig",
+      "type": "shell",
+      "command": "bash",
+      "args": ["-c", "source ~/.esp/esp-idf/export.sh && idf.py menuconfig"],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "TERM": "xterm-256color"
+        }
+      }
+    },
+    {
+      "label": "IDF: Clean",
+      "type": "shell",
+      "command": "bash",
+      "args": ["-c", "source ~/.esp/esp-idf/export.sh && idf.py fullclean"],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      }
+    }
+  ]
+}

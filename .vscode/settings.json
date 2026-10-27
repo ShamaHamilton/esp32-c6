@@ -1,0 +1,31 @@
+{
+  "idf.espIdfPath": "${env:HOME}/.esp/esp-idf",
+  "idf.pythonBinPath": "${env:HOME}/.espressif/python_env/idf6.1_py3.14_env/bin/python",
+  "idf.toolsPath": "${env:HOME}/.espressif",
+  "idf.port": "/dev/ttyACM0",
+  "idf.flashType": "UART",
+  "idf.adapterTargetName": "esp32c6",
+  "idf.monitorBaudRate": "115200",
+  "idf.buildPath": "${workspaceFolder}/build",
+  "idf.sdkconfigFilePath": "${workspaceFolder}/sdkconfig",
+  "idf.openOcdConfigs": ["interface/esp_usb_jtag.cfg", "target/esp32c6.cfg"],
+  "C_Cpp.default.configurationProvider": "espressif.esp-idf-extension",
+  "C_Cpp.default.compileCommands": "${workspaceFolder}/build/compile_commands.json",
+  "C_Cpp.errorSquiggles": "enabled",
+  "files.associations": {
+    "*.h": "c",
+    "*.c": "c"
+  },
+  "search.exclude": {
+    "**/build": true,
+    "**/.git": true,
+    "**/managed_components": true
+  },
+  "clangd.path": "~/.espressif/tools/esp-clangd/esp-21.1.3_20260408/esp-clangd/bin/clangd",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=${workspaceFolder}/build"
+  ],
+  "idf.currentSetup": "/home/shamil/.esp/esp-idf"
+}
