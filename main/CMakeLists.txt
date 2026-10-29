@@ -1,5 +1,23 @@
 idf_component_register(
-    SRCS "main.c"
-    PRIV_REQUIRES spi_flash esp_driver_gpio esp_adc
-    INCLUDE_DIRS ""
+    SRCS
+        "main.c"
+        "battery_sensor.c"
+        "protocols/proto_ble_bthome.c"
+        "protocols/proto_wifi_mqtt.c"
+        "protocols/proto_zigbee.c"
+    INCLUDE_DIRS
+        "."
+        "protocols"
+    PRIV_REQUIRES
+        driver
+        esp_adc
+        esp_timer
+        nvs_flash
+        esp_wifi
+        esp_event
+        esp_netif
+        mqtt
+        bt
+        spi_flash
+        esp_driver_gpio
 )

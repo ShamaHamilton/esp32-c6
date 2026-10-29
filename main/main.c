@@ -1,124 +1,207 @@
 /**
- * Программа для мониторинга состояния батареи и USB на ESP32-C6.
- * Считывает напряжение батареи через АЦП и состояние USB через GPIO.
- * Использует аппаратную калибровку АЦП и программное усреднение замеров.
- * Выводит состояние USB и напряжение батареи в консоль через ESP_LOGI.
+ * Главный модуль управления мониторингом АКБ и отправкой телеметрии в Home Assistant.
+ * Включает динамическую компенсацию времени активной работы (АЦП + лог + радио + сброс USB),
+ * обеспечивая строго фиксированный шаг между циклами независимо от числа выборок АЦП.
  */
 
-#include <stdio.h>                   // Стандартная библиотека ввода-вывода (для printf)
-#include "freertos/FreeRTOS.h"       // Операционная система реального времени (база для ESP)
-#include "freertos/task.h"           // Библиотека для работы с задачами и задержками (vTaskDelay)
-#include "driver/gpio.h"             // Драйвер для работы с цифровыми пинами (GPIO)
-#include "esp_log.h"                 // Библиотека для логирования сообщений в консоль
-#include "esp_adc/adc_oneshot.h"     // Драйвер АЦП (одиночные измерения)
-#include "esp_adc/adc_cali.h"        // Библиотека аппаратной калибровки АЦП
-#include "esp_adc/adc_cali_scheme.h" // Схема калибровки АЦП
-#include "esp_rom_sys.h"             // Библиотека для низкоуровневых функций ROM, таких как esp_rom_delay_us
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+#include "esp_sleep.h"
+#include "esp_timer.h" // Высокоточный 64-битный аппаратный таймер (шаг 1 мкс)
 
-// Тег для логирования сообщений в консоль
-static const char *TAG = "BATTERY_MONITOR";
+#include "app_config.h"
+#include "battery_sensor.h"
+#include "ha_telemetry.h"
 
-// Настройки пинов
-#define USB_PIN GPIO_NUM_1         // Пин, куда подключен делитель от 5V питания USB
-#define BAT_ADC_CHAN ADC_CHANNEL_0 // Канал АЦП для GPIO0 (у ESP32-C6 GPIO0 - это канал 0 для ADC1)
+static const char *TAG = "MAIN_APP";
 
-// Настройки фильтрации и калибровки АЦП
-#define SAMPLES_COUNT 64 // Количество замеров (выборок) для усреднения (сглаживания шума)
-#define ADC_DELAY_US 500 // Задержка между замерами АЦП в микросекундах (500 мкс)
+// Целевой период цикла в микросекундах (для Light / Deep Sleep) и миллисекундах (для RTOS)
+#define TARGET_PERIOD_MS ((uint32_t)(CFG_SLEEP_TIME_SEC) * 1000UL)
+#define TARGET_PERIOD_US ((int64_t)(CFG_SLEEP_TIME_SEC) * 1000000LL)
 
-// ПРОГРАММНАЯ КАЛИБРОВКА: если мультиметр показывает на батарее 4.15В, а ESP выдает 4.10В,
-// коэффициент будет 4.15 / 4.10 = 1.012. Мы умножим финальный результат на него.
-#define SOFTWARE_CALI_FACTOR 1.008
+// Минимальное безопасное время сна (1 мс), если активная фаза длилась дольше периода
+#define MIN_SLEEP_TIME_US 1000LL
 
-// Время сна в миллисекундах с учетом времени, затраченного на замеры АЦП
-#define SLEEP_TIME_SEC 5 * 1000
+/**
+ * Форматирует время работы со старта МК (в микросекундах) в читаемую строку:
+ * - до 24 часов:  "02:52:45.258"
+ * - после 24 ч:   "3d 02:52:45.258"
+ */
+static void format_uptime(int64_t time_us, char *out_buf, size_t buf_size)
+{
+    int64_t total_ms = time_us / 1000LL;
+    uint32_t ms = (uint32_t)(total_ms % 1000LL);
+
+    int64_t total_sec = total_ms / 1000LL;
+    uint32_t sec = (uint32_t)(total_sec % 60LL);
+    uint32_t min = (uint32_t)((total_sec / 60LL) % 60LL);
+    uint32_t hours = (uint32_t)((total_sec / 3600LL) % 24LL);
+    uint32_t days = (uint32_t)(total_sec / 86400LL);
+
+    if (days > 0)
+    {
+        snprintf(out_buf, buf_size, "%lud %02lu:%02lu:%02lu.%03lu",
+                 (unsigned long)days,
+                 (unsigned long)hours,
+                 (unsigned long)min,
+                 (unsigned long)sec,
+                 (unsigned long)ms);
+    }
+    else
+    {
+        snprintf(out_buf, buf_size, "%02lu:%02lu:%02lu.%03lu",
+                 (unsigned long)hours,
+                 (unsigned long)min,
+                 (unsigned long)sec,
+                 (unsigned long)ms);
+    }
+}
 
 void app_main(void)
 {
-    // ---------------------------------------------------------------------------------------------
-    // 1. НАСТРОЙКА GPIO ДЛЯ ЧТЕНИЯ НАЛИЧИЯ USB
-    // ---------------------------------------------------------------------------------------------
-    gpio_config_t io_conf = {};                   // Структура для настроек пина
-    io_conf.intr_type = GPIO_INTR_DISABLE;        // Прерывания пока отключаем
-    io_conf.mode = GPIO_MODE_INPUT;               // Режим пина: на вход (чтение)
-    io_conf.pin_bit_mask = (1ULL << USB_PIN);     // Указываем, какой именно пин настраиваем (битовая маска)
-    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE; // Отключаем внутреннюю подтяжку к земле
-    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;     // Подтяжка к питанию отключена
-    gpio_config(&io_conf);                        // Применяем настройки к пину
+    // Фиксируем самую раннюю метку времени при входе в app_main (актуально для Deep Sleep)
+    int64_t boot_entry_us = esp_timer_get_time();
 
-    // ---------------------------------------------------------------------------------------------
-    // 2. НАСТРОЙКА АЦП (ADC) ДЛЯ ИЗМЕРЕНИЯ НАПРЯЖЕНИЯ АКБ
-    // ---------------------------------------------------------------------------------------------
-    adc_oneshot_unit_handle_t adc1_handle; // Дескриптор для работы с АЦП
-    // Структура базовой настройки АЦП
-    adc_oneshot_unit_init_cfg_t init_config1 = {
-        .unit_id = ADC_UNIT_1, // Используем блок ADC1 (GPIO0 относится к нему)
-    };
-    // Инициализация АЦП с указанной конфигурацией
-    adc_oneshot_new_unit(&init_config1, &adc1_handle);
+    // 1. Инициализируем аппаратный модуль АЦП и пина USB
+    ESP_ERROR_CHECK(battery_sensor_init());
 
-    // Настройка конкретного канала (пина)
-    adc_oneshot_chan_cfg_t config = {
-        .bitwidth = ADC_BITWIDTH_DEFAULT, // Разрядность АЦП (12 бит, значения 0-4095)
-        .atten = ADC_ATTEN_DB_12,         // Аттенюация 12 дБ (диапазон измерения до ~3.1 В, а не до 1.1В)
-    };
-    // Применяем настройки к каналу АЦП
-    adc_oneshot_config_channel(adc1_handle, BAT_ADC_CHAN, &config);
+    // 2. Инициализируем выбранный протокол связи с Home Assistant
+    if (ha_telemetry_init() != ESP_OK)
+    {
+        ESP_LOGW(TAG, "Telemetry protocol init failed or timed out, continuing locally...");
+    }
 
-    // Включаем аппаратную калибровку (вшита в чип на заводе, переводит сырые значения 0-4095 в милливольты)
-    adc_cali_handle_t cali_handle = NULL;
-    adc_cali_curve_fitting_config_t cali_config = {
-        .unit_id = ADC_UNIT_1,
-        .chan = BAT_ADC_CHAN,
-        .atten = ADC_ATTEN_DB_12,
-        .bitwidth = ADC_BITWIDTH_DEFAULT,
-    };
-    // Создаем профиль калибровки для выбранного канала АЦП
-    adc_cali_create_scheme_curve_fitting(&cali_config, &cali_handle);
+#if (ACTIVE_WORK_MODE == WORK_MODE_CONTINUOUS_LOOP)
+    // Для режима цикла: фиксируем опорную точку времени в тиках FreeRTOS
+    // Прямо перед началом первой итерации while(1)
+    TickType_t last_wake_time = xTaskGetTickCount();
+    const TickType_t period_ticks = pdMS_TO_TICKS(TARGET_PERIOD_MS);
+#elif (ACTIVE_WORK_MODE == WORK_MODE_LIGHT_SLEEP)
+    // Разрешаем блоку GPIO будить чип из Light Sleep
+    ESP_ERROR_CHECK(esp_sleep_enable_gpio_wakeup());
+    // Опорная метка времени в мкс для компенсации как работы, так и выхода из Light Sleep
+    int64_t next_wakeup_target_us = esp_timer_get_time() + TARGET_PERIOD_US;
+#endif
 
-    // ---------------------------------------------------------------------------------------------
-    // 3. ОСНОВНОЙ (БЕСКОНЕЧНЫЙ) ЦИКЛ ПРОГРАММЫ
-    // ---------------------------------------------------------------------------------------------
+    // 3. Основной рабочий цикл
     while (1)
     {
-        // --- ЧТЕНИЕ USB ---
-        // Считываем состояние пина: 1 (есть напряжение) или 0 (нет напряжения)
-        int usb_connected = gpio_get_level(USB_PIN);
+        // Засекаем точное время начала замера
+        int64_t active_start_us = esp_timer_get_time();
 
-        // --- ЧТЕНИЕ и СГЛАЖИВАНИЕ АЦП ---
-        long adc_sum = 0; // Переменная для накопления суммы замеров (тип long, чтобы влезала большая сумма)
+        // Переводим микросекунды со старта в строку "ЧЧ:ММ:СС.ммм" (или "Дд ЧЧ:ММ:СС.ммм")
+        char uptime_str[32];
+        format_uptime(active_start_us, uptime_str, sizeof(uptime_str));
 
-        for (int i = 0; i < SAMPLES_COUNT; i++)
+        // --- А. Считываем показания датчиков (АЦП + статус USB) ---
+        battery_telemetry_t telemetry = {0};
+        ESP_ERROR_CHECK(battery_sensor_read(&telemetry));
+
+        uint32_t meas_duration_ms = (uint32_t)((esp_timer_get_time() - active_start_us) / 1000LL);
+
+        // --- Б. Формируем единую строку лога (теперь с точным Uptime для консоли и HA) ---
+        char log_buffer[200];
+        snprintf(log_buffer, sizeof(log_buffer),
+                 "[Uptime: %s | Wake: %s] USB: %s | ADC: %d | Bat: %.3f V (%u%%) | Meas: %lu ms",
+                 uptime_str,
+                 telemetry.wakeup_cause,
+                 telemetry.usb_plugged ? "PLUGGED" : "UNPLUGGED",
+                 telemetry.adc_raw_avg,
+                 telemetry.battery_v,
+                 telemetry.battery_pct,
+                 (unsigned long)meas_duration_ms);
+
+        ESP_LOGI(TAG, "%s", log_buffer);
+        // --- В. Отправляем данные и строку лога в Home Assistant ---
+        ha_telemetry_send(&telemetry, log_buffer);
+
+        // --- Г. Синхронизированная пауза / сон с вычитанием времени активной работы ---
+#if (ACTIVE_WORK_MODE == WORK_MODE_CONTINUOUS_LOOP)
+
+        /**
+         * РЕЖИМ 1: Непрерывный цикл (без сна процессора).
+         * vTaskDelayUntil автоматически вычитает все время, потраченное на battery_sensor_read(),
+         * ESP_LOGI() и ha_telemetry_send(), и будит задачу строго по сетке TARGET_PERIOD_MS.
+         */
+        vTaskDelayUntil(&last_wake_time, period_ticks);
+
+#elif (ACTIVE_WORK_MODE == WORK_MODE_LIGHT_SLEEP)
+
+        /**
+         * РЕЖИМ 2: Легкий сон (Light Sleep).
+         */
+        ha_telemetry_prepare_sleep();
+
+        // Настраиваем пробуждение на противоположный уровень пина USB
+        gpio_int_type_t wake_level = telemetry.usb_plugged ? GPIO_INTR_LOW_LEVEL : GPIO_INTR_HIGH_LEVEL;
+        ESP_ERROR_CHECK(gpio_wakeup_enable(CFG_USB_PIN, wake_level));
+
+        // Сначала сбрасываем буфер USB-консоли и ждем его физической отправки (20 мс),
+        // чтобы эти 20 мс тоже вошли в измеряемое время активной работы и были вычтены из сна!
+        fflush(stdout);
+        vTaskDelay(pdMS_TO_TICKS(20));
+
+        int64_t now_us = esp_timer_get_time();
+
+        // Если предыдущее пробуждение произошло досрочно (по дерганью кабеля USB),
+        // или если радиопередача затянулась дольше периода — пересчитываем сетку от текущего момента
+        uint32_t wakeup_causes = esp_sleep_get_wakeup_causes();
+        if ((wakeup_causes & (1 << ESP_SLEEP_WAKEUP_GPIO)) || (now_us >= next_wakeup_target_us))
         {
-            int raw_val; // Переменная для хранения одного замера АЦП (сырое значение 0-4095)
-            // Делаем один замер АЦП
-            adc_oneshot_read(adc1_handle, BAT_ADC_CHAN, &raw_val);
-            adc_sum += raw_val;             // Добавляем замер к общей сумме
-            esp_rom_delay_us(ADC_DELAY_US); // Небольшая (аппаратная) задержка между замерами (500 мкс) для лучшего усреднения
+            next_wakeup_target_us = now_us + TARGET_PERIOD_US;
         }
 
-        // Вычисляем среднее арифметическое сырое значение АЦП
-        int adc_raw_avg = adc_sum / SAMPLES_COUNT;
+        // Вычисляем точный остаток сна в микросекундах до следующей плановой точки сетки
+        int64_t sleep_duration_us = next_wakeup_target_us - now_us;
+        if (sleep_duration_us < MIN_SLEEP_TIME_US)
+        {
+            sleep_duration_us = MIN_SLEEP_TIME_US;
+        }
 
-        // Преобразуем усредненное сырое значение АЦП в милливольты с помощью аппаратной калибровки ESP
-        int voltage_mv = 0;
-        adc_cali_raw_to_voltage(cali_handle, adc_raw_avg, &voltage_mv);
+        ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup((uint64_t)sleep_duration_us));
 
-        // --- ФИНАЛЬНЫЙ РАСЧЕТ НАПРЯЖЕНИЯ АКБ ---
-        // 1) Делитель напряжения на плате (R1 и R2) 200k+200k делит напряжение ровно пополам,
-        // поэтому умножаем измеренное напряжение на 2, чтобы получить реальное напряжение на АКБ.
-        // 2) Делим на 1000.0, чтобы перевести милливольты в вольты (получим дробное число, например 4.15 В).
-        // 3) Умножаем на наш программный (ручной) калибровочный коэффициент SOFTWARE_CALI_FACTOR.
-        float bat_voltage = (voltage_mv * 2.0 / 1000.0) * SOFTWARE_CALI_FACTOR;
+        // Сдвигаем плановую точку для следующей итерации ровно на TARGET_PERIOD_US
+        next_wakeup_target_us += TARGET_PERIOD_US;
 
-        // --- ВЫВОД В КОНСОЛЬ ---
-        // Печатаем зеленую (INFO) строку в консоль
-        ESP_LOGI(TAG, "USB Status: %s | ADC Raw: %d | Voltage: %.3f V",
-                 usb_connected ? "PLUGGED" : "UNPLUGGED",
-                 adc_raw_avg,
-                 bat_voltage);
+        esp_light_sleep_start();
 
-        // Ждем SLEEP_TIME_SEC секунд перед следующим замером
-        vTaskDelay(pdMS_TO_TICKS(SLEEP_TIME_SEC));
+#elif (ACTIVE_WORK_MODE == WORK_MODE_DEEP_SLEEP)
+
+        /**
+         * РЕЖИМ 3: Глубокий сон (Deep Sleep).
+         * Вычитаем все время работы с момента старта app_main (включая инициализацию,
+         * замер АЦП, отправку по радио и 50 мс ожидания сброса буфера консоли).
+         */
+        ha_telemetry_prepare_sleep();
+        battery_sensor_deinit();
+
+        if (telemetry.usb_plugged)
+        {
+            esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown((1ULL << CFG_USB_PIN), ESP_GPIO_WAKEUP_GPIO_LOW);
+        }
+        else
+        {
+            esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown((1ULL << CFG_USB_PIN), ESP_GPIO_WAKEUP_GPIO_HIGH);
+        }
+
+        ESP_LOGI(TAG, "Entering Deep Sleep (compensated period: %d sec)...", CFG_SLEEP_TIME_SEC);
+        fflush(stdout);
+        vTaskDelay(pdMS_TO_TICKS(50)); // Эти 50 мс тоже учитываются и вычитаются ниже!
+
+        // Общее время бодрствования в микросекундах со старта чипа
+        int64_t total_awake_us = esp_timer_get_time() - boot_entry_us;
+        int64_t sleep_duration_us = TARGET_PERIOD_US - total_awake_us;
+        if (sleep_duration_us < MIN_SLEEP_TIME_US)
+        {
+            sleep_duration_us = MIN_SLEEP_TIME_US;
+        }
+
+        ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup((uint64_t)sleep_duration_us));
+        esp_deep_sleep_start();
+
+#endif
     }
 }

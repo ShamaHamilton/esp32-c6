@@ -22,3 +22,20 @@ idf.py -p /dev/ttyACM0 flash monitor  # Ctrl+] выход
 - Порт: `/dev/ttyACM0` (usbipd из Windows)
 - Резервные копии: `backups/`
 - [Тестирование](docs/ТЕСТИРОВАНИЕ.md) - pytest, venv, как писать и запускать тесты
+
+```Plaintext
+your_project_dir/
+├── CMakeLists.txt                   # Корневой файл сборки проекта
+├── idf_component.yml                # Менеджер зависимостей (для автозагрузки Zigbee SDK)
+└── main/
+    ├── CMakeLists.txt               # Регистрация всех исходников и папок инклудов
+    ├── app_config.h                 # Главный пульт управления: выбор Режима сна и Протокола
+    ├── main.c                       # Единая логика жизненного цикла (Cycle / Light / Deep)
+    ├── battery_sensor.h             # Заголовок драйвера измерения АКБ и пина USB
+    ├── battery_sensor.c             # Реализация чтения АЦП, фильтрации и калибровки
+    └── protocols/                   # Директория модулей связи с Home Assistant
+        ├── ha_telemetry.h           # Единый интерфейс отправки данных и логов
+        ├── proto_ble_bthome.c       # Протокол 1: BLE BTHome v2 (Автообнаружение в HA без паролей)
+        ├── proto_wifi_mqtt.c        # Протокол 2: Wi-Fi + MQTT (JSON-телеметрия + текстовый лог)
+        └── proto_zigbee.c           # Протокол 3: Zigbee 3.0 Sleepy End Device (для Z2M / ZHA)
+```
