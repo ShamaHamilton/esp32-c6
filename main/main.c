@@ -13,6 +13,7 @@
 #include "esp_adc/adc_oneshot.h"     // Драйвер АЦП (одиночные измерения)
 #include "esp_adc/adc_cali.h"        // Библиотека аппаратной калибровки АЦП
 #include "esp_adc/adc_cali_scheme.h" // Схема калибровки АЦП
+#include "esp_rom_sys.h"             // Библиотека для низкоуровневых функций ROM, таких как esp_rom_delay_us
 
 // Тег для логирования сообщений в консоль
 static const char *TAG = "BATTERY_MONITOR";
@@ -23,25 +24,27 @@ static const char *TAG = "BATTERY_MONITOR";
 
 // Настройки фильтрации и калибровки АЦП
 #define SAMPLES_COUNT 64 // Количество замеров (выборок) для усреднения (сглаживания шума)
+#define ADC_DELAY_US 500 // Задержка между замерами АЦП в микросекундах (500 мкс)
 
 // ПРОГРАММНАЯ КАЛИБРОВКА: если мультиметр показывает на батарее 4.15В, а ESP выдает 4.10В,
 // коэффициент будет 4.15 / 4.10 = 1.012. Мы умножим финальный результат на него.
 #define SOFTWARE_CALI_FACTOR 1.008
 
-#define SLEEP_TIME_SEC 5 // Время сна в секундах
+// Время сна в миллисекундах с учетом времени, затраченного на замеры АЦП
+#define SLEEP_TIME_SEC 5 * 1000
 
 void app_main(void)
 {
     // ---------------------------------------------------------------------------------------------
     // 1. НАСТРОЙКА GPIO ДЛЯ ЧТЕНИЯ НАЛИЧИЯ USB
     // ---------------------------------------------------------------------------------------------
-    gpio_config_t io_conf = {};                  // Структура для настроек пина
-    io_conf.intr_type = GPIO_INTR_DISABLE;       // Прерывания пока отключаем
-    io_conf.mode = GPIO_MODE_INPUT;              // Режим пина: на вход (чтение)
-    io_conf.pin_bit_mask = (1ULL << USB_PIN);    // Указываем, какой именно пин настраиваем (битовая маска)
-    io_conf.pull_down_en = GPIO_PULLDOWN_ENABLE; // Включаем внутреннюю подтяжку к земле
-    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;    // Подтяжка к питанию отключена
-    gpio_config(&io_conf);                       // Применяем настройки к пину
+    gpio_config_t io_conf = {};                   // Структура для настроек пина
+    io_conf.intr_type = GPIO_INTR_DISABLE;        // Прерывания пока отключаем
+    io_conf.mode = GPIO_MODE_INPUT;               // Режим пина: на вход (чтение)
+    io_conf.pin_bit_mask = (1ULL << USB_PIN);     // Указываем, какой именно пин настраиваем (битовая маска)
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE; // Отключаем внутреннюю подтяжку к земле
+    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;     // Подтяжка к питанию отключена
+    gpio_config(&io_conf);                        // Применяем настройки к пину
 
     // ---------------------------------------------------------------------------------------------
     // 2. НАСТРОЙКА АЦП (ADC) ДЛЯ ИЗМЕРЕНИЯ НАПРЯЖЕНИЯ АКБ
@@ -90,8 +93,8 @@ void app_main(void)
             int raw_val; // Переменная для хранения одного замера АЦП (сырое значение 0-4095)
             // Делаем один замер АЦП
             adc_oneshot_read(adc1_handle, BAT_ADC_CHAN, &raw_val);
-            adc_sum += raw_val;           // Добавляем замер к общей сумме
-            vTaskDelay(pdMS_TO_TICKS(1)); // Небольшая задержка между замерами (1 мс) для лучшего усреднения
+            adc_sum += raw_val;             // Добавляем замер к общей сумме
+            esp_rom_delay_us(ADC_DELAY_US); // Небольшая (аппаратная) задержка между замерами (500 мкс) для лучшего усреднения
         }
 
         // Вычисляем среднее арифметическое сырое значение АЦП
@@ -116,6 +119,6 @@ void app_main(void)
                  bat_voltage);
 
         // Ждем SLEEP_TIME_SEC секунд перед следующим замером
-        vTaskDelay(pdMS_TO_TICKS(SLEEP_TIME_SEC * 1000));
+        vTaskDelay(pdMS_TO_TICKS(SLEEP_TIME_SEC));
     }
 }

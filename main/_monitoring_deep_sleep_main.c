@@ -22,6 +22,7 @@ static const char *TAG = "BAT_SLEEP_MONITOR";
 #define USB_PIN GPIO_NUM_1         // Пин, куда подключен делитель от 5V питания USB
 #define BAT_ADC_CHAN ADC_CHANNEL_0 // Канал АЦП для GPIO0 (у ESP32-C6 GPIO0 - это канал 0 для ADC1)
 #define SAMPLES_COUNT 64           // Количество замеров (выборок) для усреднения (сглаживания шума)
+#define ADC_DELAY_US 500           // Задержка между замерами АЦП в микросекундах (500 мкс)
 // ПРОГРАММНАЯ КАЛИБРОВКА: если мультиметр показывает на батарее 4.15В, а ESP выдает 4.10В,
 // коэффициент будет 4.15 / 4.10 = 1.012. Мы умножим финальный результат на него.
 #define SOFTWARE_CALI_FACTOR 1.008 // Программный коэффициент калибровки для корректировки измеренного напряжения
@@ -59,7 +60,7 @@ void app_main(void)
     io_conf.intr_type = GPIO_INTR_DISABLE;
     io_conf.mode = GPIO_MODE_INPUT;
     io_conf.pin_bit_mask = (1ULL << USB_PIN);
-    io_conf.pull_down_en = GPIO_PULLDOWN_ENABLE;
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
     io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
     gpio_config(&io_conf);
 
@@ -95,7 +96,7 @@ void app_main(void)
         adc_sum += raw_val;
         // Здесь мы не используем vTaskDelay, чтобы не тратить время.
         // Плата должна как можно быстрее сделать замер и уснуть, чтобы экономить энергию.
-        esp_rom_delay_us(500); // 500 микросекунд (аппаратная задержка, не тормозит ОС)
+        esp_rom_delay_us(ADC_DELAY_US); // аппаратная задержка, не тормозит ОС
     }
 
     int adc_raw_avg = adc_sum / SAMPLES_COUNT;
@@ -110,6 +111,8 @@ void app_main(void)
 
     // Освобождаем память АЦП перед сном (хороший тон в C)
     adc_oneshot_del_unit(adc1_handle);
+    // Освобождаем память, занятую профилем калибровки АЦП
+    adc_cali_delete_scheme_curve_fitting(cali_handle);
 
     // =========================================================
     // 3. ПОДГОТОВКА КО СНУ (Deep Sleep)
@@ -130,6 +133,7 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Going to Deep Sleep now... Good night!\n");
 
+    fflush(stdout); // Принудительно отправляем все лог-сообщения в консоль перед сном
     // Даем логам 100 мс, чтобы они успели "улететь" по USB перед тем как чип уснет
     vTaskDelay(pdMS_TO_TICKS(100));
 
