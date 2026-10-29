@@ -1,8 +1,8 @@
 /**
- * Программа для мониторинга состояния батареи с использованием ESP32-C6.
- * Плата просыпается по таймеру или изменению состояния питания через USB,
- * измеряет напряжение батареи через АЦП, усредняет результат,
- * применяет программную калибровку и уходит обратно в глубокий сон.
+ * Программа для мониторинга состояния батареи и USB на ESP32-C6.
+ * Считывает напряжение батареи через АЦП и состояние USB через GPIO.
+ * Использует аппаратную калибровку АЦП и программное усреднение замеров.
+ * Выводит состояние USB и напряжение батареи в консоль через ESP_LOGI.
  */
 
 #include <stdio.h>                   // Стандартная библиотека ввода-вывода (для printf)
@@ -13,67 +13,56 @@
 #include "esp_adc/adc_oneshot.h"     // Драйвер АЦП (одиночные измерения)
 #include "esp_adc/adc_cali.h"        // Библиотека аппаратной калибровки АЦП
 #include "esp_adc/adc_cali_scheme.h" // Схема калибровки АЦП
-#include "esp_sleep.h"               // Библиотека для управления режимами сна
-#include "esp_rom_sys.h"             // Библиотека для низкоуровневых функций ROM, таких как esp_rom_delay_us
 
 // Тег для логирования сообщений в консоль
-static const char *TAG = "BAT_SLEEP_MONITOR";
+static const char *TAG = "BATTERY_MONITOR";
 
+// Настройки пинов
 #define USB_PIN GPIO_NUM_1         // Пин, куда подключен делитель от 5V питания USB
 #define BAT_ADC_CHAN ADC_CHANNEL_0 // Канал АЦП для GPIO0 (у ESP32-C6 GPIO0 - это канал 0 для ADC1)
-#define SAMPLES_COUNT 64           // Количество замеров (выборок) для усреднения (сглаживания шума)
+
+// Настройки фильтрации и калибровки АЦП
+#define SAMPLES_COUNT 64 // Количество замеров (выборок) для усреднения (сглаживания шума)
+
 // ПРОГРАММНАЯ КАЛИБРОВКА: если мультиметр показывает на батарее 4.15В, а ESP выдает 4.10В,
 // коэффициент будет 4.15 / 4.10 = 1.012. Мы умножим финальный результат на него.
-#define SOFTWARE_CALI_FACTOR 1.000 // Программный коэффициент калибровки для корректировки измеренного напряжения
-// Время, через которое плата должна проснуться сама (в секундах)
-// Например, просыпаться каждый час (3600) или каждые 30 секунд для тестов
-#define SLEEP_TIME_SEC 30 // Время сна в секундах между проверками батареи
+#define SOFTWARE_CALI_FACTOR 1.008
+
+#define SLEEP_TIME_SEC 5 // Время сна в секундах
 
 void app_main(void)
 {
-    // =========================================================
-    // 1. АНАЛИЗ ПРИЧИНЫ ПРОБУЖДЕНИЯ
-    // =========================================================
+    // ---------------------------------------------------------------------------------------------
+    // 1. НАСТРОЙКА GPIO ДЛЯ ЧТЕНИЯ НАЛИЧИЯ USB
+    // ---------------------------------------------------------------------------------------------
+    gpio_config_t io_conf = {};                  // Структура для настроек пина
+    io_conf.intr_type = GPIO_INTR_DISABLE;       // Прерывания пока отключаем
+    io_conf.mode = GPIO_MODE_INPUT;              // Режим пина: на вход (чтение)
+    io_conf.pin_bit_mask = (1ULL << USB_PIN);    // Указываем, какой именно пин настраиваем (битовая маска)
+    io_conf.pull_down_en = GPIO_PULLDOWN_ENABLE; // Включаем внутреннюю подтяжку к земле
+    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;    // Подтяжка к питанию отключена
+    gpio_config(&io_conf);                       // Применяем настройки к пину
 
-    // Функция возвращает uint32_t маску со всеми флагами пробуждения
-    uint32_t wakeup_causes = esp_sleep_get_wakeup_causes();
-
-    // Проверяем биты через побитовое И (сдвигаем 1 на номер причины)
-    if (wakeup_causes & (1 << ESP_SLEEP_WAKEUP_TIMER)) // Проснулись по таймеру (прошло заданное время)
-    {
-        ESP_LOGI(TAG, "Woke up by TIMER. Time to check battery.");
-    }
-    else if (wakeup_causes & (1 << ESP_SLEEP_WAKEUP_GPIO))
-    {
-        ESP_LOGI(TAG, "Woke up by USB PIN change.");
-    }
-    else
-    {
-        ESP_LOGI(TAG, "Normal boot / Reset.");
-    }
-
-    // =========================================================
-    // 2. БЫСТРАЯ НАСТРОЙКА И ЗАМЕРЫ
-    // =========================================================
-    gpio_config_t io_conf = {};
-    io_conf.intr_type = GPIO_INTR_DISABLE;
-    io_conf.mode = GPIO_MODE_INPUT;
-    io_conf.pin_bit_mask = (1ULL << USB_PIN);
-    io_conf.pull_down_en = GPIO_PULLDOWN_ENABLE;
-    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-    gpio_config(&io_conf);
-
-    // Настраиваем АЦП
-    adc_oneshot_unit_handle_t adc1_handle;
-    adc_oneshot_unit_init_cfg_t init_config1 = {.unit_id = ADC_UNIT_1};
+    // ---------------------------------------------------------------------------------------------
+    // 2. НАСТРОЙКА АЦП (ADC) ДЛЯ ИЗМЕРЕНИЯ НАПРЯЖЕНИЯ АКБ
+    // ---------------------------------------------------------------------------------------------
+    adc_oneshot_unit_handle_t adc1_handle; // Дескриптор для работы с АЦП
+    // Структура базовой настройки АЦП
+    adc_oneshot_unit_init_cfg_t init_config1 = {
+        .unit_id = ADC_UNIT_1, // Используем блок ADC1 (GPIO0 относится к нему)
+    };
+    // Инициализация АЦП с указанной конфигурацией
     adc_oneshot_new_unit(&init_config1, &adc1_handle);
 
+    // Настройка конкретного канала (пина)
     adc_oneshot_chan_cfg_t config = {
-        .bitwidth = ADC_BITWIDTH_DEFAULT,
-        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT, // Разрядность АЦП (12 бит, значения 0-4095)
+        .atten = ADC_ATTEN_DB_12,         // Аттенюация 12 дБ (диапазон измерения до ~3.1 В, а не до 1.1В)
     };
+    // Применяем настройки к каналу АЦП
     adc_oneshot_config_channel(adc1_handle, BAT_ADC_CHAN, &config);
 
+    // Включаем аппаратную калибровку (вшита в чип на заводе, переводит сырые значения 0-4095 в милливольты)
     adc_cali_handle_t cali_handle = NULL;
     adc_cali_curve_fitting_config_t cali_config = {
         .unit_id = ADC_UNIT_1,
@@ -81,58 +70,52 @@ void app_main(void)
         .atten = ADC_ATTEN_DB_12,
         .bitwidth = ADC_BITWIDTH_DEFAULT,
     };
+    // Создаем профиль калибровки для выбранного канала АЦП
     adc_cali_create_scheme_curve_fitting(&cali_config, &cali_handle);
 
-    // Читаем состояние USB
-    int usb_connected = gpio_get_level(USB_PIN);
-
-    // Усредняем АЦП
-    long adc_sum = 0;
-    for (int i = 0; i < SAMPLES_COUNT; i++)
+    // ---------------------------------------------------------------------------------------------
+    // 3. ОСНОВНОЙ (БЕСКОНЕЧНЫЙ) ЦИКЛ ПРОГРАММЫ
+    // ---------------------------------------------------------------------------------------------
+    while (1)
     {
-        int raw_val;
-        adc_oneshot_read(adc1_handle, BAT_ADC_CHAN, &raw_val);
-        adc_sum += raw_val;
-        // Здесь мы не используем vTaskDelay, чтобы не тратить время.
-        // Плата должна как можно быстрее сделать замер и уснуть, чтобы экономить энергию.
-        esp_rom_delay_us(500); // 500 микросекунд (аппаратная задержка, не тормозит ОС)
+        // --- ЧТЕНИЕ USB ---
+        // Считываем состояние пина: 1 (есть напряжение) или 0 (нет напряжения)
+        int usb_connected = gpio_get_level(USB_PIN);
+
+        // --- ЧТЕНИЕ и СГЛАЖИВАНИЕ АЦП ---
+        long adc_sum = 0; // Переменная для накопления суммы замеров (тип long, чтобы влезала большая сумма)
+
+        for (int i = 0; i < SAMPLES_COUNT; i++)
+        {
+            int raw_val; // Переменная для хранения одного замера АЦП (сырое значение 0-4095)
+            // Делаем один замер АЦП
+            adc_oneshot_read(adc1_handle, BAT_ADC_CHAN, &raw_val);
+            adc_sum += raw_val;           // Добавляем замер к общей сумме
+            vTaskDelay(pdMS_TO_TICKS(1)); // Небольшая задержка между замерами (1 мс) для лучшего усреднения
+        }
+
+        // Вычисляем среднее арифметическое сырое значение АЦП
+        int adc_raw_avg = adc_sum / SAMPLES_COUNT;
+
+        // Преобразуем усредненное сырое значение АЦП в милливольты с помощью аппаратной калибровки ESP
+        int voltage_mv = 0;
+        adc_cali_raw_to_voltage(cali_handle, adc_raw_avg, &voltage_mv);
+
+        // --- ФИНАЛЬНЫЙ РАСЧЕТ НАПРЯЖЕНИЯ АКБ ---
+        // 1) Делитель напряжения на плате (R1 и R2) 200k+200k делит напряжение ровно пополам,
+        // поэтому умножаем измеренное напряжение на 2, чтобы получить реальное напряжение на АКБ.
+        // 2) Делим на 1000.0, чтобы перевести милливольты в вольты (получим дробное число, например 4.15 В).
+        // 3) Умножаем на наш программный (ручной) калибровочный коэффициент SOFTWARE_CALI_FACTOR.
+        float bat_voltage = (voltage_mv * 2.0 / 1000.0) * SOFTWARE_CALI_FACTOR;
+
+        // --- ВЫВОД В КОНСОЛЬ ---
+        // Печатаем зеленую (INFO) строку в консоль
+        ESP_LOGI(TAG, "USB Status: %s | ADC Raw: %d | Voltage: %.3f V",
+                 usb_connected ? "PLUGGED" : "UNPLUGGED",
+                 adc_raw_avg,
+                 bat_voltage);
+
+        // Ждем SLEEP_TIME_SEC секунд перед следующим замером
+        vTaskDelay(pdMS_TO_TICKS(SLEEP_TIME_SEC * 1000));
     }
-
-    int adc_raw_avg = adc_sum / SAMPLES_COUNT;
-    int voltage_mv = 0;
-    adc_cali_raw_to_voltage(cali_handle, adc_raw_avg, &voltage_mv);
-    float bat_voltage = (voltage_mv * 2.0 / 1000.0) * SOFTWARE_CALI_FACTOR;
-
-    ESP_LOGI(TAG, "--- SYSTEM STATUS ---");
-    ESP_LOGI(TAG, "USB Status: %s", usb_connected ? "PLUGGED IN" : "UNPLUGGED");
-    ESP_LOGI(TAG, "Battery Voltage: %.2f V", bat_voltage);
-    ESP_LOGI(TAG, "---------------------");
-
-    // Освобождаем память АЦП перед сном (хороший тон в C)
-    adc_oneshot_del_unit(adc1_handle);
-
-    // =========================================================
-    // 3. ПОДГОТОВКА КО СНУ (Deep Sleep)
-    // =========================================================
-    esp_sleep_enable_timer_wakeup(SLEEP_TIME_SEC * 1000000ULL);
-
-    // В v6.1 функция esp_deep_sleep_enable_gpio_wakeup заменена на:
-    if (usb_connected)
-    {
-        ESP_LOGI(TAG, "Setting wakeup condition: USB unplug (LOW level).");
-        esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown((1ULL << USB_PIN), ESP_GPIO_WAKEUP_GPIO_LOW);
-    }
-    else
-    {
-        ESP_LOGI(TAG, "Setting wakeup condition: USB plug (HIGH level).");
-        esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown((1ULL << USB_PIN), ESP_GPIO_WAKEUP_GPIO_HIGH);
-    }
-
-    ESP_LOGI(TAG, "Going to Deep Sleep now... Good night!\n");
-
-    // Даем логам 100 мс, чтобы они успели "улететь" по USB перед тем как чип уснет
-    vTaskDelay(pdMS_TO_TICKS(100));
-
-    // Уходим в глубокий сон. Код ниже этой строчки никогда не выполнится.
-    esp_deep_sleep_start();
 }

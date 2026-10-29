@@ -26,7 +26,9 @@ static const char *TAG = "BATTERY_MONITOR";
 
 // ПРОГРАММНАЯ КАЛИБРОВКА: если мультиметр показывает на батарее 4.15В, а ESP выдает 4.10В,
 // коэффициент будет 4.15 / 4.10 = 1.012. Мы умножим финальный результат на него.
-#define SOFTWARE_CALI_FACTOR 1.000
+#define SOFTWARE_CALI_FACTOR 1.008
+
+#define SLEEP_TIME_SEC 5 // Время сна в секундах
 
 void app_main(void)
 {
@@ -108,12 +110,12 @@ void app_main(void)
 
         // --- ВЫВОД В КОНСОЛЬ ---
         // Печатаем зеленую (INFO) строку в консоль
-        ESP_LOGI(TAG, "USB Status: %s | ADC Raw: %d | Voltage: %.2f V",
+        ESP_LOGI(TAG, "USB Status: %s | ADC Raw: %d | Voltage: %.3f V",
                  usb_connected ? "PLUGGED" : "UNPLUGGED",
                  adc_raw_avg,
                  bat_voltage);
 
-        // Ждем 2000 мс (2 секунды) перед следующим замером
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        // Ждем SLEEP_TIME_SEC секунд перед следующим замером
+        vTaskDelay(pdMS_TO_TICKS(SLEEP_TIME_SEC * 1000));
     }
 }

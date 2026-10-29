@@ -1,3 +1,10 @@
+/**
+ * Программа для мониторинга состояния батареи с использованием ESP32-C6.
+ * Плата просыпается по таймеру или изменению состояния питания через USB,
+ * измеряет напряжение батареи через АЦП, усредняет результат,
+ * применяет программную калибровку и уходит обратно в глубокий сон.
+ */
+
 #include <stdio.h>                   // Стандартная библиотека ввода-вывода (для printf)
 #include "freertos/FreeRTOS.h"       // Операционная система реального времени (база для ESP)
 #include "freertos/task.h"           // Библиотека для работы с задачами и задержками (vTaskDelay)
@@ -17,19 +24,22 @@ static const char *TAG = "BAT_SLEEP_MONITOR";
 #define SAMPLES_COUNT 64           // Количество замеров (выборок) для усреднения (сглаживания шума)
 // ПРОГРАММНАЯ КАЛИБРОВКА: если мультиметр показывает на батарее 4.15В, а ESP выдает 4.10В,
 // коэффициент будет 4.15 / 4.10 = 1.012. Мы умножим финальный результат на него.
-#define SOFTWARE_CALI_FACTOR 1.000 // Программный коэффициент калибровки для корректировки измеренного напряжения
-#define SLEEP_TIME_SEC 30          // Время сна в секундах между проверками батареи
+#define SOFTWARE_CALI_FACTOR 1.008 // Программный коэффициент калибровки для корректировки измеренного напряжения
+// Время, через которое плата должна проснуться сама (в секундах)
+// Например, просыпаться каждый час (3600) или каждые 30 секунд для тестов
+#define SLEEP_TIME_SEC 30 // Время сна в секундах между проверками батареи
 
 void app_main(void)
 {
     // =========================================================
-    // 1. АНАЛИЗ ПРИЧИНЫ ПРОБУЖДЕНИЯ (НОВЫЙ API v6.1)
+    // 1. АНАЛИЗ ПРИЧИНЫ ПРОБУЖДЕНИЯ
     // =========================================================
-    // В v6.1 функция возвращает uint32_t маску со всеми флагами пробуждения
+
+    // Функция возвращает uint32_t маску со всеми флагами пробуждения
     uint32_t wakeup_causes = esp_sleep_get_wakeup_causes();
 
     // Проверяем биты через побитовое И (сдвигаем 1 на номер причины)
-    if (wakeup_causes & (1 << ESP_SLEEP_WAKEUP_TIMER))
+    if (wakeup_causes & (1 << ESP_SLEEP_WAKEUP_TIMER)) // Проснулись по таймеру (прошло заданное время)
     {
         ESP_LOGI(TAG, "Woke up by TIMER. Time to check battery.");
     }
@@ -53,6 +63,7 @@ void app_main(void)
     io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
     gpio_config(&io_conf);
 
+    // Настраиваем АЦП
     adc_oneshot_unit_handle_t adc1_handle;
     adc_oneshot_unit_init_cfg_t init_config1 = {.unit_id = ADC_UNIT_1};
     adc_oneshot_new_unit(&init_config1, &adc1_handle);
@@ -72,15 +83,19 @@ void app_main(void)
     };
     adc_cali_create_scheme_curve_fitting(&cali_config, &cali_handle);
 
+    // Читаем состояние USB
     int usb_connected = gpio_get_level(USB_PIN);
 
+    // Усредняем АЦП
     long adc_sum = 0;
     for (int i = 0; i < SAMPLES_COUNT; i++)
     {
         int raw_val;
         adc_oneshot_read(adc1_handle, BAT_ADC_CHAN, &raw_val);
         adc_sum += raw_val;
-        esp_rom_delay_us(500);
+        // Здесь мы не используем vTaskDelay, чтобы не тратить время.
+        // Плата должна как можно быстрее сделать замер и уснуть, чтобы экономить энергию.
+        esp_rom_delay_us(500); // 500 микросекунд (аппаратная задержка, не тормозит ОС)
     }
 
     int adc_raw_avg = adc_sum / SAMPLES_COUNT;
@@ -90,14 +105,14 @@ void app_main(void)
 
     ESP_LOGI(TAG, "--- SYSTEM STATUS ---");
     ESP_LOGI(TAG, "USB Status: %s", usb_connected ? "PLUGGED IN" : "UNPLUGGED");
-    ESP_LOGI(TAG, "Battery Voltage: %.2f V", bat_voltage);
+    ESP_LOGI(TAG, "Battery Voltage: %.3f V", bat_voltage);
     ESP_LOGI(TAG, "---------------------");
 
-    // Освобождаем память АЦП
+    // Освобождаем память АЦП перед сном (хороший тон в C)
     adc_oneshot_del_unit(adc1_handle);
 
     // =========================================================
-    // 3. ПОДГОТОВКА КО СНУ (Новые функции v6.1)
+    // 3. ПОДГОТОВКА КО СНУ (Deep Sleep)
     // =========================================================
     esp_sleep_enable_timer_wakeup(SLEEP_TIME_SEC * 1000000ULL);
 
@@ -118,5 +133,10 @@ void app_main(void)
     // Даем логам 100 мс, чтобы они успели "улететь" по USB перед тем как чип уснет
     vTaskDelay(pdMS_TO_TICKS(100));
 
+    // Уходим в глубокий сон. Код ниже этой строчки никогда не выполнится.
     esp_deep_sleep_start();
 }
+
+// Как перепрошить плату, которая переходит в режим сна?
+// Нужно удерживать кнопку BOOT при подаче питания,
+// чтобы ESP32-C6 не уходила в глубокий сон и позволяла загрузчику принять новую прошивку.
